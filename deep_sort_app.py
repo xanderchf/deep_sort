@@ -1,5 +1,7 @@
 # vim: expandtab:ts=4:sw=4
 from __future__ import division, print_function, absolute_import
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning) 
 
 import argparse
 import os
@@ -12,17 +14,19 @@ from application_util import visualization
 from deep_sort import nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
+import json
+from tqdm import tqdm
 
 
-def gather_sequence_info(sequence_dir, detection_file):
+def gather_sequence_info(image_dir, groundtruth, detections):
     """Gather sequence information, such as image filenames, detections,
     groundtruth (if available).
 
     Parameters
     ----------
-    sequence_dir : str
-        Path to the MOTChallenge sequence directory.
-    detection_file : str
+    image_dir : str
+        Path to the BDD tracking dataset directory.
+    detection_dir : str
         Path to the detection file.
 
     Returns
@@ -40,47 +44,17 @@ def gather_sequence_info(sequence_dir, detection_file):
         * max_frame_idx: Index of the last frame.
 
     """
-    image_dir = os.path.join(sequence_dir, "img1")
-    image_filenames = {
-        int(os.path.splitext(f)[0]): os.path.join(image_dir, f)
-        for f in os.listdir(image_dir)}
-    groundtruth_file = os.path.join(sequence_dir, "gt/gt.txt")
-
-    detections = None
-    if detection_file is not None:
-        detections = np.load(detection_file)
-    groundtruth = None
-    if os.path.exists(groundtruth_file):
-        groundtruth = np.loadtxt(groundtruth_file, delimiter=',')
-
-    if len(image_filenames) > 0:
-        image = cv2.imread(next(iter(image_filenames.values())),
-                           cv2.IMREAD_GRAYSCALE)
-        image_size = image.shape
-    else:
-        image_size = None
-
-    if len(image_filenames) > 0:
-        min_frame_idx = min(image_filenames.keys())
-        max_frame_idx = max(image_filenames.keys())
-    else:
-        min_frame_idx = int(detections[:, 0].min())
-        max_frame_idx = int(detections[:, 0].max())
-
-    info_filename = os.path.join(sequence_dir, "seqinfo.ini")
-    if os.path.exists(info_filename):
-        with open(info_filename, "r") as f:
-            line_splits = [l.split('=') for l in f.read().splitlines()[1:]]
-            info_dict = dict(
-                s for s in line_splits if isinstance(s, list) and len(s) == 2)
-
-        update_ms = 1000 / int(info_dict["frameRate"])
-    else:
-        update_ms = None
+    
+    sequence_name = groundtruth[0]['video_name']
+    image_size = (720, 1280, 3)
+    frame_idxs = [g['index'] for g in groundtruth]
+    image_filenames = [os.path.join(image_dir, g['name']) for g in groundtruth]
+    min_frame_idx, max_frame_idx = min(frame_idxs), max(frame_idxs)
+    update_ms = 1000 / 5
 
     feature_dim = detections.shape[1] - 10 if detections is not None else 0
     seq_info = {
-        "sequence_name": os.path.basename(sequence_dir),
+        "sequence_name": sequence_name,
         "image_filenames": image_filenames,
         "detections": detections,
         "groundtruth": groundtruth,
@@ -90,6 +64,7 @@ def gather_sequence_info(sequence_dir, detection_file):
         "feature_dim": feature_dim,
         "update_ms": update_ms
     }
+        
     return seq_info
 
 
@@ -126,20 +101,17 @@ def create_detections(detection_mat, frame_idx, min_height=0):
     return detection_list
 
 
-def run(sequence_dir, detection_file, output_file, min_confidence,
+def run(image_dir, groundtruth, detections, min_confidence,
         nms_max_overlap, min_detection_height, max_cosine_distance,
         nn_budget, display):
     """Run multi-target tracker on a particular sequence.
 
     Parameters
     ----------
-    sequence_dir : str
+    image_dir : str
         Path to the MOTChallenge sequence directory.
-    detection_file : str
+    detection_dir : str
         Path to the detections file.
-    output_file : str
-        Path to the tracking output file. This file will contain the tracking
-        results on completion.
     min_confidence : float
         Detection confidence threshold. Disregard all detections that have
         a confidence lower than this value.
@@ -157,7 +129,7 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         If True, show visualization of intermediate tracking results.
 
     """
-    seq_info = gather_sequence_info(sequence_dir, detection_file)
+    seq_info = gather_sequence_info(image_dir, groundtruth, detections)
     metric = nn_matching.NearestNeighborDistanceMetric(
         "cosine", max_cosine_distance, nn_budget)
     tracker = Tracker(metric)
@@ -204,34 +176,77 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
     else:
         visualizer = visualization.NoVisualization(seq_info)
     visualizer.run(frame_callback)
-
-    # Store results.
-    f = open(output_file, 'w')
+    
+    out = []
+    curr_idx = -1
+    img = None
     for row in results:
-        print('%d,%d,%.2f,%.2f,%.2f,%.2f,1,-1,-1,-1' % (
-            row[0], row[1], row[2], row[3], row[4], row[5]),file=f)
-
-
+        if curr_idx != row[0]:
+            if img != None:
+                out += [img]
+            img = {
+                    'videoName': video_name,
+                    'name': '{}-{}.jpg'.format(video_name, str(row[0]).zfill(6)),
+                    'index': row[0],
+                    'labels': []
+                }
+            curr_idx = row[0]
+            
+        img['labels'] += [{
+                            'category': None,
+                            'box2d': {
+                                        'x1': row[2], 'y1': row[3],
+                                        'x2': row[2] + row[4],
+                                        'y2': row[3] + row[5]
+                                     },
+                            'id': row[1]
+                        }]
+    
+    out += [img]
+    
+    return out
+        
+                        
 def bool_string(input_string):
     if input_string not in {"True","False"}:
         raise ValueError("Please Enter a valid Ture/False choice")
     else:
         return (input_string == "True")
 
+
+def get_gt_labels(gt_dir):
+    
+    with open(gt_dir) as f:
+        gt_annos = json.load(f)
+    
+    # group by videos
+    annos_by_video = {}
+    for gt_anno in gt_annos:
+        if gt_anno['video_name'] in annos_by_video.keys():
+            annos_by_video[gt_anno['video_name']] += [gt_anno]
+        else:
+            annos_by_video[gt_anno['video_name']] = [gt_anno]
+    
+    return annos_by_video
+    
+
 def parse_args():
     """ Parse command line arguments.
     """
     parser = argparse.ArgumentParser(description="Deep SORT")
     parser.add_argument(
-        "--sequence_dir", help="Path to MOTChallenge sequence directory",
+        "--image_dir", help="Path to BDD tracking sequence directory",
         default=None, required=True)
     parser.add_argument(
-        "--detection_file", help="Path to custom detections.", default=None,
+        "--gt_dir", help="Path to the ground truth labels of the BDD tracking sequences",
+        default=None, required=True)
+    parser.add_argument(
+        "--detection_dir", help="Path to custom detections.", default=None,
         required=True)
     parser.add_argument(
-        "--output_file", help="Path to the tracking output file. This file will"
+        "--output_dir", help="Path to the tracking output directory. This file will"
         " contain the tracking results on completion.",
-        default="/tmp/hypotheses.txt")
+        default="/tmp/hypotheses")
     parser.add_argument(
         "--min_confidence", help="Detection confidence threshold. Disregard "
         "all detections that have a confidence lower than this value.",
@@ -257,7 +272,19 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    run(
-        args.sequence_dir, args.detection_file, args.output_file,
-        args.min_confidence, args.nms_max_overlap, args.min_detection_height,
-        args.max_cosine_distance, args.nn_budget, args.display)
+    annos_by_video = get_gt_labels(args.gt_dir)
+    
+    out = []
+    for detection_file in tqdm(os.listdir(args.detection_dir)):
+        detection_dir = os.path.join(args.detection_dir, detection_file)
+        video_name = detection_file.split('.')[0]
+        groundtruth = annos_by_video[video_name]
+        detections = np.load(detection_dir)
+        
+        out += [run(
+            args.image_dir, groundtruth, detections,
+            args.min_confidence, args.nms_max_overlap, args.min_detection_height,
+            args.max_cosine_distance, args.nn_budget, args.display)]
+            
+    with open(args.output_dir, 'w') as f:
+        json.dump(out, f)
